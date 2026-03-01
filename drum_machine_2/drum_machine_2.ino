@@ -2,7 +2,6 @@
    VB-909 Rhythm Composer
 
    Arduino drum machine.
-   Requirements pending.
 
    allomyrina volbot <tech@volbot.org>
    */
@@ -13,6 +12,9 @@
 
 #include <Vector.h>
 
+// I'm storing the last 5 read values from the tempo knob, because valid tempos (~80-180) are close enough to the numerical outputs of the rotary encoders (0-1000) that they need to be debounced by more than floating-point rounding
+// When a value is read from the rotary encoder, it gets pushed into this vector, popping another value at the same time, and the current tempo is set to the average of all of these values
+// Higher values of CACHE_MAX result in better debouncing, but less precision and responsiveness from the tempo knob
 const int CACHE_MAX = 5;
 int storage_array[CACHE_MAX];
 Vector<int> vector(storage_array);
@@ -23,30 +25,41 @@ Vector<int> vector(storage_array);
 // # SETUP #
 // #########
 
-int beat_increment = 0;
-// int bpm = 0;
-int bpm = 120;
-unsigned long last_beat_time = 0;
-double beat_time = 0;
+int beat_increment = 0; //the beat we're on, out of 16
+int bpm = 120; //tempo
+unsigned long last_beat_time = 0; //running time, used to determine when a new beat starts
+double beat_time = 0; //time of one beat, based on bpm. used to determine when a new beat starts
 
-int instrument_index = 0;
+int instrument_index = 0; //currently selected instrument of those below
+//list of instrument names (4char Max) to display on-screen
 char *instruments[8] = {"Kck1", "Kck2", "Clap", "Rim",
                         "Snre", "Tom",  "Hat1", "Hat2"};
 
+// 4 built-in drum sequence slots
+// for efficiency, patterns are stored as 8 16-bit numbers, one for each instrument
+// a 1 means "play this instrument on this beat"
 int program[4][8] = {
     {0x8080, 0, 0x0808, 0, 0, 0, 0, 0x2223}, // HOUSE
-    {0x5555, 0x8888, 0, 0, 0x2222, 0, 0, 0}, // EMPTY
+    {0x5555, 0x8888, 0, 0, 0x2222, 0, 0, 0}, // ????
     {0x8888, 0, 0, 0x1212, 0, 0, 0x2222, 0}, // REGGAETON
     {0, 0, 0, 0, 0, 0, 0, 0},                // EMPTY
 };
 
-int program_index = 0;
+int program_index = 0; //currently selected program, of those above
+//increments program index. not used in production, but i haven't touched this code in long enough that i'm terrified to delete anything
 void incProgIndex() {
   program_index++;
   if (program_index >= 4)
     program_index = 0;
 }
 
+//play/pause
+bool playing = 0;
+
+//self-explanatory
+void togglePlaying() { playing = !playing; }
+
+// TEMPO KNOB CONSTANTS
 // Rotary Encoder pins: Channel A, Channel B, Button
 const int PIN_RE1[3] = {0, 1, 13};
 // Limited Value Constants: Default, Interval, Min, Max
@@ -54,6 +67,7 @@ const int VAL_BPM[4] = {120, 5, 60, 220};
 // Limited Value Variables: Current, Last
 volatile int VAR_BPM[2] = {VAL_BPM[0], VAL_BPM[0]};
 
+// VOLUME KNOB CONSTANTS
 // Rotary Encoder pins: Channel A, Channel B, Button
 const int PIN_RE2[3] = {2, 11, 12};
 // Limited Value Constants: Default, Interval, Min, Max
@@ -61,10 +75,11 @@ const int VAL_VOL[4] = {20, 2, 0, 30};
 // Limited Value Variables: Current, Last
 volatile int VAR_VOL[2] = {VAL_VOL[0], VAL_VOL[0]};
 
-// #############
-// # FUNCTIONS #
-// #############
+// #################
+// # BPM FUNCTIONS #
+// #################
 
+//reads BPM from tempo knob (calculation step)
 void readBPM() {
   int sensorValue = analogRead(A0);
   if (vector.size() == vector.max_size())
@@ -80,6 +95,7 @@ void readBPM() {
   propagateBPM(convOut + 60);
 }
 
+//updates global bpm and beat_time according to bpm_ (propagation step)
 void propagateBPM(int bpm_) {
   bpm = bpm_;
   double bpms = bpm_ / 60000.0;
@@ -106,22 +122,26 @@ void propagateBPM(int bpm_) {
 #define D7 6
 LiquidCrystal_74HC595 lcd(DS, SHCP, STCP, RS, E, D4, D5, D6, D7);
 
-// #############
-// # FUNCTIONS #
-// #############
+// #####################
+// # LCD/BIT FUNCTIONS #
+// #####################
 
+//gets a single bit from a number
 int get_bit(int num, int bit_position) {
   int mask = 1 << bit_position;
   return (num & mask) >> bit_position;
 }
 
+//sets up LCD screen
 void setupLCD() {
   lcd.begin(16, 2);
   lcd.print(":3");
 }
 
+//assembles and prints a string to LCD containing current data (instrument, program, and beats)
 void printLCD() {
   lcd.clear();
+  //print basic data
   lcd.setCursor(0, 0);
   lcd.print("[");
   lcd.print(bpm);
@@ -135,13 +155,20 @@ void printLCD() {
   lcd.print(":");
   lcd.print(program_index + 1);
   lcd.setCursor(0, 1);
+
+  //this loop assembles the 16-character beat grid. there's probably a more efficient way to do this but this gets the job done and didn't cause me any issues
+  //iterate through each beat
   for (int i = 0; i < 16; i++) {
+    //by default, display a `-`
     char *toprint = "-";
+    //if `selected instrument` is playing on this beat, display a `*`
     if (get_bit(program[program_index][instrument_index], 15 - i)) {
       toprint = "*";
     } else {
       int found = 0;
+      //iterate through each instrument
       for (int j = 0; j < 8; j++) {
+        //if `any instrument` is playing on this beat, display a `+`
         if (get_bit(program[program_index][j], 15 - i)) {
           toprint = "+";
           break;
@@ -152,12 +179,16 @@ void printLCD() {
     lcd.print(toprint);
   }
   lcd.cursor();
+  //set cursor to the current beat — this way, an underline moves along with the beat
   lcd.setCursor(beat_increment, 1);
 }
 
 // ###################
 // ## GENERAL SETUP ##
 // ###################
+
+//much of the following code is for setting up the DFPlayer, which is a lot of boilerplate.
+//a lot of it is courtesy of https://github.com/Makuna/DFMiniMp3
 #include <DFMiniMp3.h>
 
 #include <SoftwareSerial.h>
@@ -168,9 +199,6 @@ SoftwareSerial secondarySerial(7, 6); // RX, TX
 
 class Mp3Notify;
 
-// define a handy type using serial and our notify class
-//
-// typedef DFMiniMp3<SoftwareSerial, Mp3Notify, Mp3ChipOriginal, 1600> DfMp3;
 typedef DFMiniMp3<SoftwareSerial, Mp3Notify> DfMp3;
 
 class Mp3Notify {
@@ -216,6 +244,7 @@ public:
 
 DfMp3 dfmp3(secondarySerial);
 
+//sets up the DFPlayer for MP3 playback
 void setupMp3() {
   DebugOut.begin(115200);
 
@@ -248,6 +277,7 @@ void setupMp3() {
   DebugOut.println("starting...");
 }
 
+//shift register setup
 #define NUMBER_OF_SHIFT_CHIPS 2
 #define DATA_WIDTH 16
 #define PULSE_WIDTH_USEC 5
@@ -262,6 +292,7 @@ int INclockPin = 4;
 BYTES_VAL_T pinValues;
 BYTES_VAL_T oldPinValues;
 
+//reads shift registers for new values
 BYTES_VAL_T read_shift_regs() {
   digitalWrite(INlatchPin, LOW);
   digitalWrite(INlatchPin, HIGH);
@@ -280,6 +311,7 @@ BYTES_VAL_T read_shift_regs() {
   DebugOut.println();
 }
 
+//initializes shift register pins
 void setupShiftRegisters() {
   pinMode(INlatchPin, OUTPUT);
   pinMode(INclockPin, OUTPUT);
@@ -291,6 +323,8 @@ void setupShiftRegisters() {
   // oldPinValues = pinValues;
 }
 
+//reads a rotary encoder for its current value
+//returns 0 or 1 for whether the value changed
 int read_encoder(int PIN_RE[], int VAL[], volatile int VAR[]) {
   // Encoder routine. Updates counter if they are valid
   // and if rotated a full indent
@@ -323,6 +357,7 @@ int read_encoder(int PIN_RE[], int VAL[], volatile int VAR[]) {
     changed = 1;
   }
 
+  //update stored values
   if (changed) {
     if (VAR[0] > VAL[3]) {
       VAR[0] = VAL[3];
@@ -333,6 +368,7 @@ int read_encoder(int PIN_RE[], int VAL[], volatile int VAR[]) {
   return changed;
 }
 
+//reads a digital button with debounce
 int read_button(int PIN, bool last, void (*callback)()) {
   int state = digitalRead(PIN);
   if (state == LOW) {
@@ -348,9 +384,7 @@ int read_button(int PIN, bool last, void (*callback)()) {
   return last;
 }
 
-bool playing = 0;
-void togglePlaying() { playing = !playing; }
-
+//runs all above setup functions and initializes pins
 void setup() {
   setupLCD();
   setupMp3();
@@ -367,19 +401,19 @@ void setup() {
   oldPinValues = 0;
 }
 
+//main loop
 void loop() {
 
   unsigned long time = 0;
   time = millis();
 
-  // static int lastCounterA = counterA;
-  // static int lastCounterB = counterB;
   static int button1Engaged = 0;
   static int button2Engaged = 0;
   int shift = button1Engaged;
   int state_changed = 0;
 
   if (playing) {
+    // if a new beat has started, play queued instruments
     if (time - last_beat_time >= beat_time) {
       last_beat_time = time;
       beat_increment++;
@@ -395,6 +429,7 @@ void loop() {
     }
   }
 
+  //read VOL and BPM knobs
   if (read_encoder(PIN_RE1, VAL_BPM, VAR_BPM)) {
     state_changed = 1;
     propagateBPM(VAR_BPM[0]);
@@ -404,6 +439,7 @@ void loop() {
     dfmp3.setVolume(VAR_VOL[0]);
   }
 
+  //poll buttons every 50ms; needed because of shift register delay
   if (time - last_poll_time >= 50) {
     last_poll_time = time;
     // Step 1: Sample
@@ -446,6 +482,7 @@ void loop() {
     }
   }
 
+  //read rotary encoder buttons (press knob down)
   if (button1Engaged = read_button(PIN_RE1[2], button1Engaged, 0))
     state_changed = 1;
 
@@ -458,6 +495,4 @@ void loop() {
   if (time % 100 == 0) {
     dfmp3.loop();
   }
-
-  // delay(beat_time);
 }
